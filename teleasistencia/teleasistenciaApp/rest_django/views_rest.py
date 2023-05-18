@@ -21,7 +21,9 @@ from rest_framework import status
 # Serializadores generales
 from rest_framework.response import Response
 
-from .utils import getQueryAnd
+from django.utils.connection import ConnectionDoesNotExist
+from .utils import getQueryAnd, partial_update_generico
+
 # Modelos propios
 from ..models import *
 # Serializadores propios
@@ -32,35 +34,40 @@ from django.http import JsonResponse
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
 
-from utilidad.logging import info, blue
+from utilidad.logging import info, blue, red
 
 
-# Comprobamos si el usuario es profesor. Se utiliza para la discernir entre solicitudes de Profesor y Teleoperador
-class IsTeacherMember(permissions.BasePermission):
-
+# Comprobamos si el usuario es administrador. Se utiliza para la discernir
+# entre solicitudes de Administrador, Profesor y Teleoperador
+class IsAdminMember(permissions.BasePermission):
     def has_permission(self, request, view):
-        #return True
-        if request.user.groups.filter(name="profesor").exists():
-            return True
+        # Si el usuario tiene el grupo tiene el permiso
+        return request.user.groups.filter(name="administrador").exists()
+
+
+# Comprobamos si el usuario es profesor. Se utiliza para la discernir
+# entre solicitudes de Administrador, Profesor y Teleoperador
+class IsTeacherMember(permissions.BasePermission):
+    def has_permission(self, request, view):
+        # Si el usuario tiene el grupo tiene el permiso
+        return request.user.groups.filter(name="profesor").exists()
+
 
 # Creamos la vista Profile que  modificara los datos y retornara la informacion del usuario activo en la aplicación
 class ProfileViewSet(viewsets.ModelViewSet):
     queryset = User.objects.all().order_by('-date_joined')
     serializer_class = UserSerializer
+
     def list(self, request, *args, **kwargs):
-        #Obtenemos el usuario filtrando por el usuario de la request
+        # Obtenemos el usuario filtrando por el usuario de la request
         queryset = User.objects.filter(username=request.user)
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
 
     def update(self, request, *args, **kwargs):
-
         try:
             user = User.objects.get(username=request.user,id=kwargs["pk"])
-        except:
-            return Response("Error: El usuario no coincide con el usuario identificado",405)
 
-        if user:
             if request.data.get("email") is not None:
                 user.email = request.data.get("email")
             if request.data.get("password") is not None:
@@ -72,7 +79,7 @@ class ProfileViewSet(viewsets.ModelViewSet):
                 # Extraer la imagen que han subido
                 img = request.FILES["imagen"]
 
-                # Si el usuario ya tenia otra borro la anterior y la guardo
+                # Si el usuario ya tenia otra borro (save() custom) la anterior y la guardo
                 user_image = Imagen_User.objects.filter(user=user).first()
                 if user_image:
                     user_image.imagen = img
@@ -87,13 +94,32 @@ class ProfileViewSet(viewsets.ModelViewSet):
                 # Guardar cambios
                 user_image.save()
 
+            # Si el usuario es un administrador permitirle cambiar su BBDD seleccionada.
+            if request.user.has_perms([IsAdminMember]) and request.data.get("id_database") is not None:
+                db_user = Database_User.objects.get(user=user)
+                new_db = Database.objects.get(pk=request.data.get("id_database"))
+                # Si se ha hecho un cambio de base de datos
+                if new_db is not db_user.database:
+                    # Cambiamos la BBDD asignada
+                    db_user.database = new_db
+                    db_user.save()
+                    # Guardamos el usuario en la nueva DDBB
+                    user.save(using=new_db.nameDescritive)
+
             user.save()
 
             # Devolvemos el user modificado con su imagen
             user_serializer = self.get_serializer(user, many=False)
             return Response(user_serializer.data)
-        else:
-            return Response("Error: El usuario no coincide con el usuario identificado",405)
+
+        except User.DoesNotExist:
+            return Response("Error: El usuario no coincide con el usuario identificado", 405)
+        except Database.DoesNotExist:
+            return Response("Error: No existe ninguna base de datos con ese id", 405)
+        except ConnectionDoesNotExist as e:
+            red("TeleasistenciaApp", e)
+            return Response("Error: No existe ninguna base de datos con ese id", 405)
+
 
 class UserViewSet(viewsets.ModelViewSet):
     """
@@ -189,19 +215,23 @@ class UserViewSet(viewsets.ModelViewSet):
             user.last_name = request.data.get("last_name")
         user.save()
         if request.FILES:
+            # Extraer la imagen que han subido
             img = request.FILES["imagen"]
-            image = Imagen_User.objects.filter(user=user).first()
-            if image:
-                if (image.imagen) is not None:
-                    os.remove(image.imagen.path)
-                image.imagen = img
-                image.save()
+
+            # Si el usuario ya tenia otra borro (save() custom) la anterior y la guardo
+            user_image = Imagen_User.objects.filter(user=user).first()
+            if user_image:
+                user_image.imagen = img
+
+            # Si no tenia imagen se la añado al usuario
             else:
-                image = Imagen_User(
+                user_image = Imagen_User(
                     user=user,
                     imagen=img
                 )
-            image.save()
+
+            # Guardar cambios
+            user_image.save()
 
         # Devolvemos el user creado
         user_serializer = self.get_serializer(user, many=False)
@@ -209,24 +239,29 @@ class UserViewSet(viewsets.ModelViewSet):
 
     def destroy(self, request, *args, **kwargs):
         blue("TeleasistenciaApp", f"ViewsRest: {kwargs}")
-        user = User.objects.get(pk=kwargs["pk"])
         try:
-          image = Imagen_User.objects.get(user=user)
+            # Sacar la bbdd y hacer el borrado en la BBDD en la que nos encontramos
+            database = Database_User.objects.get(user=request.user).database
+            db_user = User.objects.using(database.nameDescritive).get(pk=kwargs["pk"])
+            db_user.delete()
+            # Borrar en la BBDD default, puede fallar si no estaba registrado en otra BBDD
+            try:
+                user = User.objects.get(pk=kwargs["pk"])
+                user.delete()
+            except:
+                pass
 
-          if image.imagen is not None:
-             os.remove(image.imagen.path)
+            return Response('Se ha eliminado correctamente')
+        except User.DoesNotExist:
+            return Response('Error: No existe ningún usuario con esa id', 405)
         except:
-            info("Error propio",405)
-        user.delete()
+            return Response("Error Interno", 500)
 
 
-        # MULTIDATABASE: Para las multibase de datos creamos el usuario en la nueva base e datos
-        database_user = Database_User.objects.get(user=request.user)
-        user = User.objects.using(database_user.database.nameDescritive).get(pk=kwargs["pk"])
-        user.delete()
-
-        return Response('borrado')
-
+class DatabaseViewSet(viewsets.ModelViewSet):
+    queryset = Database.objects.all()
+    serializer_class = DatabaseSerializer
+    permission_classes = [IsAdminMember]
 
 class PermissionViewSet(viewsets.ModelViewSet):
     """
@@ -243,10 +278,20 @@ class GroupViewSet(viewsets.ModelViewSet):
     """
     queryset = Group.objects.all()
     serializer_class = GroupSerializer
+    http_method_names=['get']
 
-    # permission_classes = [permissions.IsAdminUser]
-    permission_classes = [IsTeacherMember]
+    # Solo permitirmos que el grupo administrador se muestra para ellos mismos,
+    # así no permitimos seleccionarlo en los usuarios del servicio
+    def list(self, request, *args, **kwargs):
+        # Hacemos una búsqueda por los valores introducidos por parámetros
+        is_group_admin = request.user.groups.filter(name='administrador')
 
+        if not is_group_admin:
+            queryset = Group.objects.exclude(name= 'administrador')
+        else:
+            queryset = Group.objects.all()
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
 
 class Clasificacion_Recurso_Comunitario_ViewSet(viewsets.ModelViewSet):
     """
@@ -1038,12 +1083,9 @@ class Paciente_ViewSet(viewsets.ModelViewSet):
         paciente_serializer = Paciente_Serializer(paciente)
         return Response(paciente_serializer.data)
 
+    # Ejemplo de cómo se haría un PATCH genérico
     def partial_update(self, request, *args, **kwargs):
-        paciente = Paciente.objects.get(pk=kwargs["pk"])
-        paciente.numero_seguridad_social = request.data.get("numero_seguridad_social")
-        paciente.save()
-        paciente_serializer = Paciente_Serializer(paciente)
-        return Response(paciente_serializer.data)
+        return Response(partial_update_generico(self, request, *args, **kwargs))
 
     def destroy(self, request, *args, **kwargs):
         #Conseguimos el parametro de la URL
