@@ -4,6 +4,7 @@ from rest_framework import serializers
 #Modelos propios:
 from rest_framework.utils.representation import serializer_repr
 
+from .utils import getDatabaseByUser
 from ..models import *
 
 class ImagenUserSerializer(serializers.ModelSerializer):
@@ -12,12 +13,19 @@ class ImagenUserSerializer(serializers.ModelSerializer):
        fields = ['imagen']
 
 class UserSerializer(serializers.ModelSerializer):
-
    imagen = ImagenUserSerializer(source='imagen_user', read_only=True)
+   database_id = serializers.SerializerMethodField()
    class Meta:
        model = User
-       fields = ['id', 'url', 'last_login', 'username', 'first_name', 'last_name', 'email', 'date_joined', 'groups', 'imagen']
+       fields = ['id', 'url', 'database_id', 'is_active', 'last_login', 'username', 'first_name', 'last_name', 'email', 'date_joined', 'groups', 'imagen']
        depth = 1
+
+   def get_database_id(self, obj):
+       try:
+           db_user = obj.database_user  # Assuming the related name is "database_user"
+           return db_user.database.pk
+       except Database_User.DoesNotExist:
+           return None
 
 class PermissionSerializer(serializers.ModelSerializer):
     class Meta:
@@ -27,7 +35,7 @@ class PermissionSerializer(serializers.ModelSerializer):
 class DatabaseSerializer(serializers.ModelSerializer):
     class Meta:
         model = Database
-        fields = '__all__'
+        fields = ['id','nameDescritive']
 
 class GroupSerializer(serializers.ModelSerializer):
     class Meta:
@@ -44,14 +52,14 @@ class Tipo_Recurso_Comunitario_Serializer(serializers.ModelSerializer):
     class Meta:
         model = Tipo_Recurso_Comunitario
         fields = '__all__' #Indica todos los campos
+
     def create(self, validated_data):
-        database_user =Database_User.objects.get(user=self.context["request"].user)
-        return self.Meta.model.objects.db_manager(database_user.database.nameDescritive).create(**validated_data)
+        # Selecciona la base de datos y crear los valores introducidos
+        return self.Meta.model.objects.db_manager(getDatabaseByUser(self.context["request"].user)).create(**validated_data)
     '''
     def update(self, instance, validated_data):
-        database_user =Database_User.objects.get(user=self.context["request"].user)
-        cambios =Tipo_Recurso_Comunitario.objects.db_manager(database_user.database.nameDescritive).filter(id=instance.id).update(**validated_data)
-        return cambios
+        self.Meta.model.objects.db_manager(getDatabaseByUser(self)).filter(id=instance.id).update(**validated_data)
+        return self.Meta.model.objects.db_manager(getDatabaseByUser(self)).get(id=instance.id)
     '''
 
 
@@ -91,7 +99,7 @@ class Historico_Agenda_Llamadas_Serializer(serializers.ModelSerializer):
     class Meta:
         model = Historico_Agenda_Llamadas
         fields = '__all__'
-        depth = 2
+        depth = 3
 
 
 class Agenda_Serializer(serializers.ModelSerializer):
